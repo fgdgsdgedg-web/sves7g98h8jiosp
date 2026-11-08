@@ -19,7 +19,8 @@ const defaultDB = {
     siteName: 'Vanish Rat',
     title: 'Vanish Rat',
     version: '1.1.0',
-    adminGate: 'vanish_op_7x9k'
+    adminGate: 'vanish_op_7x9k',
+    opPassHash: ''
   },
   roles: [
     { id: 'r_operator', name: 'operator', perms: ['*'] },

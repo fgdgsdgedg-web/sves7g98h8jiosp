@@ -50,6 +50,38 @@ function logAudit(actor, action, meta) {
   saveDB(db);
 }
 
+
+async function hashPass(s) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('vr_op_v1:' + s));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function requestAdminPass() {
+  const db = loadDB();
+  const stored = db.settings.opPassHash || '';
+  if (!stored) {
+    // first time: set password
+    const p1 = prompt('Задайте пароль оператора (сохраните его, в коде его нет):');
+    if (!p1 || p1.length < 6) { toast('Минимум 6 символов', 'error'); return false; }
+    const p2 = prompt('Повторите пароль оператора:');
+    if (p1 !== p2) { toast('Не совпадает', 'error'); return false; }
+    db.settings.opPassHash = await hashPass(p1);
+    auditPush(db, state.session?.login || 'op', 'op_pass_set', {});
+    saveDB(db);
+    toast('Пароль оператора установлен', 'success');
+    return true;
+  }
+  const attempt = prompt('Пароль оператора:');
+  if (!attempt) return false;
+  const h = await hashPass(attempt);
+  if (h === stored) {
+    logAudit(state.session?.login || 'op', 'op_pass_ok', {});
+    return true;
+  }
+  logAudit(state.session?.login || 'op', 'op_pass_fail', {});
+  return false;
+}
+
 async function init() {
   protectDevtoolsEnhanced();
   const db = loadDB();
@@ -70,11 +102,23 @@ async function init() {
   }
 
   const gate = (location.hash || '').replace(/^#\/?/, '');
-  if (gate === db.settings.adminGate && state.session && Auth.isOperator(state.session)) {
-    state.view = 'admin';
-    logAudit(state.session.login, 'admin_enter', { gate: true });
-  } else if (state.session) {
+  if (state.session) {
     state.view = 'panel';
+    if (gate === db.settings.adminGate && Auth.isOperator(state.session)) {
+      // password gate async after first paint
+      setTimeout(() => {
+        requestAdminPass().then(ok => {
+          if (ok) {
+            state.view = 'admin';
+            logAudit(state.session.login, 'admin_enter', { gate: true });
+            render();
+          } else {
+            location.hash = '';
+            toast('Нужен пароль оператора', 'error');
+          }
+        });
+      }, 100);
+    }
   }
 
   render();
@@ -82,29 +126,38 @@ async function init() {
 }
 
 function protectDevtoolsEnhanced() {
+  protectDevtools();
   document.addEventListener('contextmenu', e => {
     e.preventDefault();
     logAudit(state.session?.login || 'anon', 'devtools_contextmenu', {});
   });
-  document.addEventListener('keydown', e => {
-    const blocked = e.key === 'F12' ||
-      (e.ctrlKey && e.shiftKey && ['I', 'J', 'C'].includes((e.key || '').toUpperCase())) ||
-      (e.ctrlKey && (e.key || '').toUpperCase() === 'U');
-    if (blocked) {
-      e.preventDefault();
-      e.stopPropagation();
-      logAudit(state.session?.login || 'anon', 'devtools_attempt', { key: e.key });
-      return false;
-    }
-  });
   let devOpen = false;
   setInterval(() => {
-    const w = window.outerWidth - window.innerWidth > 120 || window.outerHeight - window.innerHeight > 120;
+    const w = window.outerWidth - window.innerWidth > 160 || window.outerHeight - window.innerHeight > 160;
     if (w && !devOpen) {
       devOpen = true;
       logAudit(state.session?.login || 'anon', 'devtools_open_detect', {});
     } else if (!w) devOpen = false;
-  }, 2000);
+  }, 2500);
+  // anti-iframe
+  try { if (window.top !== window.self) { window.top.location = window.location.href; } } catch (_) {}
+  // freeze console in production-ish way
+  try {
+    const noop = () => {};
+    if (!location.hostname || location.hostname === '127.0.0.1' || location.hostname === 'localhost') {
+      // keep console on local
+    } else {
+      ['log','debug','info','warn','error','table','dir'].forEach(m => {
+        try { console[m] = noop; } catch (_) {}
+      });
+    }
+  } catch (_) {}
+  // disable drag
+  document.addEventListener('dragstart', e => e.preventDefault());
+  // clear selection on sensitive
+  document.addEventListener('selectstart', e => {
+    if (e.target && e.target.closest && e.target.closest('.no-select')) e.preventDefault();
+  });
 }
 
 function render() {
@@ -1242,13 +1295,32 @@ function view404() {
   return wrap;
 }
 
-document.addEventListener('DOMContentLoaded', init);
+function boot() {
+  try { init(); } catch (e) { console.error('[Vanish] boot', e); }
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot);
+} else {
+  boot();
+}
 window.addEventListener('hashchange', () => {
-  const db = loadDB();
-  const gate = (location.hash || '').replace(/^#\/?/, '');
-  if (gate === db.settings.adminGate && state.session && Auth.isOperator(state.session)) {
-    state.view = 'admin';
-    logAudit(state.session.login, 'admin_enter', { hash: true });
-    render();
-  }
+  try {
+    const db = loadDB();
+    const gate = (location.hash || '').replace(/^#\/?/, '');
+    if (gate === db.settings.adminGate && state.session && Auth.isOperator(state.session)) {
+      requestAdminPass().then(ok => {
+        if (ok) {
+          state.view = 'admin';
+          logAudit(state.session.login, 'admin_enter', { hash: true });
+          render();
+        } else {
+          location.hash = '';
+          toast('Неверный пароль оператора', 'error');
+        }
+      });
+    }
+  } catch (e) { console.error(e); }
 });
+window._vanishAudit = (action, meta) => {
+  try { logAudit(state.session?.login || 'anon', action, meta || {}); } catch (_) {}
+};
